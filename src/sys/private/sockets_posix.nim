@@ -9,6 +9,11 @@
 import syscall/posix
 import errors
 
+when defined(linux) and staticExec("uname -r") >= "5.1":
+  import ".."/ioqueue/iouring
+  import pkg/nimuring
+  const use_iouring = true
+
 type
   SockFlag = enum
     ## Flags used for makeSocket
@@ -62,35 +67,47 @@ template writeImpl() {.dirty.} =
 
   result = written
 
-template asyncReadImpl() {.dirty.} =
-  while true:
-    let bytesRead = retryOnEIntr: read(s.fd.cint, buf, bufLen)
+when use_iouring:
+  template asyncReadImpl() {.dirty.} =
+    let cqe = submit getSqe().read(s.fd.cint, buf, bufLen)
+    if cqe.res < 0:
+      raise newIOError(0, cqe.res, $Error.Read)
+    return cqe.res
+  template asyncWriteImpl() {.dirty.} =
+    let cqe = submit getSqe().write(s.fd.cint, buf, bufLen)
+    if cqe.res < 0:
+      raise newIOError(0, cqe.res, $Error.Write)
+    return cqe.res
+else:
+  template asyncReadImpl() {.dirty.} =
+    while true:
+      let bytesRead = retryOnEIntr: read(s.fd.cint, buf, bufLen)
 
-    if bytesRead == -1:
-      # On "no data yet" signal
-      if errno == EAGAIN or errno == EWOULDBLOCK:
-        # Wait until there is data
-        wait(s.fd, Event.Read)
+      if bytesRead == -1:
+        # On "no data yet" signal
+        if errno == EAGAIN or errno == EWOULDBLOCK:
+          # Wait until there is data
+          wait(s.fd, Event.Read)
+        else:
+          raise newIOError(0, errno, $Error.Read)
       else:
-        raise newIOError(0, errno, $Error.Read)
-    else:
-      # Done
-      return bytesRead
+        # Done
+        return bytesRead
 
-template asyncWriteImpl() {.dirty.} =
-  while true:
-    let written = retryOnEIntr: write(s.fd.cint, buf, bufLen)
+  template asyncWriteImpl() {.dirty.} =
+    while true:
+      let written = retryOnEIntr: write(s.fd.cint, buf, bufLen)
 
-    if written == -1:
-      # On "no buffer space yet" signal
-      if errno == EAGAIN or errno == EWOULDBLOCK:
-        # Wait until there is space
-        wait(s.fd, Event.Write)
+      if written == -1:
+        # On "no buffer space yet" signal
+        if errno == EAGAIN or errno == EWOULDBLOCK:
+          # Wait until there is space
+          wait(s.fd, Event.Write)
+        else:
+          raise newIOError(0, errno, $Error.Write)
       else:
-        raise newIOError(0, errno, $Error.Write)
-    else:
-      # Done
-      return written
+        # Done
+        return written
 
 type
   ResolverResultImpl* = object
@@ -192,30 +209,48 @@ template tcpConnect() {.dirty.} =
   # Take ownership of the socket from the handle
   result = Conn[TCP] newSocket(sock)
 
-template tcpAsyncConnect() {.dirty.} =
-  let addressFamily =
-    when endpoint is IP4Endpoint:
-      AF_INET
-    elif endpoint is IP6Endpoint:
-      AF_INET6
-  var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP, {sfNonBlock})
+when use_iouring:
+  template tcpAsyncConnect() {.dirty.} =
+    let addressFamily =
+      when endpoint is IP4Endpoint:
+        AF_INET
+      elif endpoint is IP6Endpoint:
+        AF_INET6
+    # Socket has to be blocking since it shouldnt return EINPROGRESS
+    var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP, {})
+    let cqe = submit getSqe().connect(
+      SocketHandle(sock.fd),
+      cast[ptr Sockaddr](unsafeAddr endpoint),
+      SockLen sizeof(endpoint))
+    if cqe.res < 0:
+      raise newOSError(cqe.res, $Error.Connect)
+    # A move has to be done in CPS
+    result = AsyncConn[TCP] newAsyncSocket(move sock)
+else:
+  template tcpAsyncConnect() {.dirty.} =
+    let addressFamily =
+      when endpoint is IP4Endpoint:
+        AF_INET
+      elif endpoint is IP6Endpoint:
+        AF_INET6
+    var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP, {sfNonBlock})
 
-  if connect(
-    SocketHandle(sock.fd),
-    cast[ptr Sockaddr](unsafeAddr endpoint),
-    SockLen sizeof(endpoint)
-  ) == -1:
-    # If the connection is happening asynchronously
-    if errno == EINPROGRESS or errno == EINTR:
-      # Wait until the socket is writable, which is when it is "connected" (see connect(3p)).
-      wait(sock, Event.Write)
+    if connect(
+      SocketHandle(sock.fd),
+      cast[ptr Sockaddr](unsafeAddr endpoint),
+      SockLen sizeof(endpoint)
+    ) == -1:
+      # If the connection is happening asynchronously
+      if errno == EINPROGRESS or errno == EINTR:
+        # Wait until the socket is writable, which is when it is "connected" (see connect(3p)).
+        wait(sock, Event.Write)
 
-      handleAsyncConnectResult(sock.fd)
-    else:
-      raise newOSError(errno, $Error.Connect)
+        handleAsyncConnectResult(sock.fd)
+      else:
+        raise newOSError(errno, $Error.Connect)
 
-  # A move has to be done in CPS
-  result = AsyncConn[TCP] newAsyncSocket(move sock)
+    # A move has to be done in CPS
+    result = AsyncConn[TCP] newAsyncSocket(move sock)
 
 func maxBacklog(): Natural =
   ## Retrieve the maximum backlog value for the target OS
@@ -254,51 +289,77 @@ template tcpListen() {.dirty.} =
 
   result = Listener[TCP] newSocket(sock)
 
-template tcpAsyncListen() {.dirty.} =
-  let addressFamily =
-    when endpoint is IP4Endpoint:
-      AF_INET
-    elif endpoint is IP6Endpoint:
-      AF_INET6
+when use_iouring:
+  # io_uring hasnt bind or listen equivalent
+  # XXX: then it should be sort of epoll/
+  template tcpAsyncListen() {.dirty.} =
+    let addressFamily =
+      when endpoint is IP4Endpoint:
+        AF_INET
+      elif endpoint is IP6Endpoint:
+        AF_INET6
 
-  var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP, {sfNonBlock})
+    var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP)
 
-  if bindSocket(
-    SocketHandle(sock.fd),
-    cast[ptr SockAddr](unsafeAddr endpoint),
-    SockLen sizeof(endpoint)
-  ) == -1:
-    # While this is shown in the POSIX manual to be a possible error value, in
-    # practice it appears that not many (if any) OS actually implements bind
-    # this way (judging from their manuals).
-    if errno == EINPROGRESS:
-      # Wait until the socket is readable, which is when it is "bound" (see bind(3p)).
-      wait(sock, Event.Read)
+    # Bind the address to the socket
+    posixChk bindSocket(
+      SocketHandle(sock.fd),
+      cast[ptr SockAddr](unsafeAddr endpoint),
+      SockLen sizeof(endpoint)
+    ):
+      $Error.Listen
 
-      # Examine the SO_ERROR in SOL_SOCKET for any error happened during the asynchronous operation.
-      var
-        error: cint
-        errorLen = SockLen sizeof(error)
-      posixChk getsockopt(
-        SocketHandle(sock.fd), SOL_SOCKET, SO_ERROR, addr error, addr errorLen
-      ):
-        $Error.Connect
+    # Mark the socket as accepting connections
+    posixChk listen(SocketHandle(sock.fd), backlog.get(maxBacklog()).cint):
+      $Error.Listen
+    
+    result = AsyncListener[TCP] newAsyncSocket(move sock)
+else:
+  template tcpAsyncListen() {.dirty.} =
+    let addressFamily =
+      when endpoint is IP4Endpoint:
+        AF_INET
+      elif endpoint is IP6Endpoint:
+        AF_INET6
 
-      assert errorLen == SockLen sizeof(error):
-        "The length of the error does not match nim-sys assumption. This is a nim-sys bug."
+    var sock = makeSocket(addressFamily, SOCK_STREAM, IPPROTO_TCP, {sfNonBlock})
 
-      # Raise the error if any was found.
-      if error != 0:
-        raise newOSError(error, $Error.Listen)
-    else:
-      raise newOSError(errno, $Error.Listen)
+    if bindSocket(
+      SocketHandle(sock.fd),
+      cast[ptr SockAddr](unsafeAddr endpoint),
+      SockLen sizeof(endpoint)
+    ) == -1:
+      # While this is shown in the POSIX manual to be a possible error value, in
+      # practice it appears that not many (if any) OS actually implements bind
+      # this way (judging from their manuals).
+      if errno == EINPROGRESS:
+        # Wait until the socket is readable, which is when it is "bound" (see bind(3p)).
+        wait(sock, Event.Read)
 
-  # Mark the socket as accepting connections
-  posixChk listen(SocketHandle(sock.fd), backlog.get(maxBacklog()).cint):
-    $Error.Listen
+        # Examine the SO_ERROR in SOL_SOCKET for any error happened during the asynchronous operation.
+        var
+          error: cint
+          errorLen = SockLen sizeof(error)
+        posixChk getsockopt(
+          SocketHandle(sock.fd), SOL_SOCKET, SO_ERROR, addr error, addr errorLen
+        ):
+          $Error.Connect
 
-  # An explicit move has to be done in CPS
-  result = AsyncListener[TCP] newAsyncSocket(move sock)
+        assert errorLen == SockLen sizeof(error):
+          "The length of the error does not match nim-sys assumption. This is a nim-sys bug."
+
+        # Raise the error if any was found.
+        if error != 0:
+          raise newOSError(error, $Error.Listen)
+      else:
+        raise newOSError(errno, $Error.Listen)
+
+    # Mark the socket as accepting connections
+    posixChk listen(SocketHandle(sock.fd), backlog.get(maxBacklog()).cint):
+      $Error.Listen
+
+    # An explicit move has to be done in CPS
+    result = AsyncListener[TCP] newAsyncSocket(move sock)
 
 proc commonAccept[T](fd: SocketFD, remoteAddr: var T,
                      flags: set[SockFlag] = {}): Handle[SocketFD] =
@@ -364,29 +425,49 @@ template tcpAccept() {.dirty.} =
   else:
     doAssert false, "Unexpected remote address family: " & $saddr.ss_family
 
-template tcpAsyncAccept() {.dirty.} =
-  # Loop until we get a connection
-  while true:
+when use_iouring:
+  template tcpAsyncAccept() {.dirty.} =
     var saddr: SockaddrStorage
-    var conn = commonAccept(l.fd, saddr, {sfNonBlock})
-
-    if conn.fd == InvalidFD:
-      # If the socket signals that no connections are pending
-      if errno == EAGAIN or errno == EWOULDBLOCK:
-        # Wait until some shows up then try again
-        wait(l.fd, Event.Read)
-      else:
-        raise newOSError(errno, $Error.Accept)
+    var remoteLen = SockLen(sizeof saddr)
+    let cqe = submit getSqe().accept(
+      SocketHandle(l.fd),
+      cast[ptr SockAddr](addr saddr), addr remoteLen, O_CLOEXEC)
+    var conn = initHandle:
+      SocketFD:
+        cqe.res
+    # We got a connection
+    result.conn = AsyncConn[TCP] newAsyncSocket(move conn)
+    if saddr.ss_family == AF_INET.TSa_Family:
+      result.remote = IPEndpoint(kind: V4, v4: cast[IP4Endpoint](saddr))
+    elif saddr.ss_family == AF_INET6.TSa_Family:
+      result.remote = IPEndpoint(kind: V6, v6: cast[IP6Endpoint](saddr))
     else:
-      # We got a connection
-      result.conn = AsyncConn[TCP] newAsyncSocket(move conn)
-      if saddr.ss_family == AF_INET.TSa_Family:
-        result.remote = IPEndpoint(kind: V4, v4: cast[IP4Endpoint](saddr))
-      elif saddr.ss_family == AF_INET6.TSa_Family:
-        result.remote = IPEndpoint(kind: V6, v6: cast[IP6Endpoint](saddr))
+      doAssert false, "Unexpected remote address family: " & $saddr.ss_family
+    return
+else:
+  template tcpAsyncAccept() {.dirty.} =
+    # Loop until we get a connection
+    while true:
+      var saddr: SockaddrStorage
+      var conn = commonAccept(l.fd, saddr, {sfNonBlock})
+
+      if conn.fd == InvalidFD:
+        # If the socket signals that no connections are pending
+        if errno == EAGAIN or errno == EWOULDBLOCK:
+          # Wait until some shows up then try again
+          wait(l.fd, Event.Read)
+        else:
+          raise newOSError(errno, $Error.Accept)
       else:
-        doAssert false, "Unexpected remote address family: " & $saddr.ss_family
-      return
+        # We got a connection
+        result.conn = AsyncConn[TCP] newAsyncSocket(move conn)
+        if saddr.ss_family == AF_INET.TSa_Family:
+          result.remote = IPEndpoint(kind: V4, v4: cast[IP4Endpoint](saddr))
+        elif saddr.ss_family == AF_INET6.TSa_Family:
+          result.remote = IPEndpoint(kind: V6, v6: cast[IP6Endpoint](saddr))
+        else:
+          doAssert false, "Unexpected remote address family: " & $saddr.ss_family
+        return
 
 template tcpLocalEndpoint() {.dirty.} =
   var
