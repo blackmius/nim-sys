@@ -53,7 +53,12 @@ proc newPrematureCloseDefect*(id: int): ref PrematureCloseDefect =
   result.id = id
 
 when defined(linux):
-  include private/ioqueue_linux
+  when staticExec("uname -r") >= "5.1":
+    # io_uring available since kernel 5.1
+    include private/ioqueue_iouring
+    from ioqueue/iouring {.all.} import nil
+  else:
+    include private/ioqueue_linux
 elif defined(macosx) or defined(bsd):
   include private/ioqueue_bsd
 elif defined(windows):
